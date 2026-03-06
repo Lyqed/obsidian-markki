@@ -88,6 +88,9 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
   private externalSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // Lock: files currently being processed (prevents concurrent runs)
   private processingFiles = new Set<string>();
+  // Content patched via editor API but not yet auto-saved to disk.
+  // Used so subsequent processFile calls see the right content before auto-save fires.
+  private pendingFileContent = new Map<string, string>();
   // Cross-session state persisted via loadData/saveData
   private trackedIds = new Map<string, Set<number>>();
   private bulletTextHashes = new Map<number, string>();
@@ -270,7 +273,9 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
   }
 
   private async _processFile(file: TFile): Promise<void> {
-    const content = await this.app.vault.read(file);
+    // Prefer in-memory content patched via editor API over disk (which may lag behind auto-save).
+    const content = this.pendingFileContent.get(file.path) ?? await this.app.vault.read(file);
+    this.pendingFileContent.delete(file.path);
     const markers = parseAnkiMarkers(content);
 
     // Skip files with no anki markers
@@ -401,19 +406,23 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
 
     if (changedLines.size > 0) {
       const newContent = lines.join('\n');
-      this.lastWrittenContent.set(file.path, newContent);
 
       const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
       if (activeView?.file?.path === file.path && activeView.editor) {
-        // Active file: patch only the changed lines via the editor API so the
-        // viewport is not disturbed, then write to disk via the adapter directly.
-        // vault.modify pushes the full content back through the editor pipeline
-        // and resets the viewport — that is the screen jump.
+        // Active file: patch only the changed lines through the editor API.
+        // Any disk write (vault.modify or adapter.write) causes Obsidian to
+        // push the full content back into the editor, resetting the viewport.
+        // Instead, cache the expected content so the next processFile call
+        // sees it before Obsidian's auto-save writes it to disk.
+        this.pendingFileContent.set(file.path, newContent);
+        // Guard the upcoming auto-save vault.on('modify') event so it does
+        // not trigger a redundant processFile run.
+        this.lastWrittenContent.set(file.path, newContent);
         for (const lineNum of changedLines) {
           activeView.editor.setLine(lineNum, lines[lineNum]);
         }
-        await this.app.vault.adapter.write(file.path, newContent);
       } else {
+        this.lastWrittenContent.set(file.path, newContent);
         await this.app.vault.modify(file, newContent);
       }
     }
