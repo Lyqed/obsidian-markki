@@ -8,7 +8,7 @@
 
 ---
 
-Markki is an Obsidian plugin that turns bullet points into Anki flashcards — automatically. Mark a bullet, and an AI generates the best card type, fixes your typos, picks the right deck, and syncs to Anki. No manual sync commands. No reformatting.
+Markki is an Obsidian plugin that turns bullet points into Anki flashcards, automatically. Mark a bullet and an AI generates the best card type, fixes your typos, picks the right deck, and syncs to Anki. No manual sync commands. No reformatting.
 
 ---
 
@@ -16,7 +16,7 @@ Markki is an Obsidian plugin that turns bullet points into Anki flashcards — a
 
 1. Place your cursor on any bullet point
 2. Run the command **"Mark bullet as Anki card"** (assign it a hotkey)
-3. A tiny purple dot `⬤` appears at the end of the line — invisible until you need it
+3. A tiny purple dot `⬤` appears at the end of the line, invisible until you need it
 4. After **15 seconds** of inactivity, the AI generates the card and it appears in Anki
 5. **Delete the dot** → the Anki card is deleted automatically
 
@@ -43,8 +43,8 @@ After sync, the card ID is written back silently:
 
 The AI chooses the best type automatically:
 
-- **Basic** — question + answer (most content)
-- **Cloze** — fill-in-the-blank, when a specific term should be recalled inline (`{{c1::...}}`)
+- **Basic**: question + answer (most content)
+- **Cloze**: fill-in-the-blank, for when a specific term should be recalled inline (`{{c1::...}}`)
 
 ---
 
@@ -91,5 +91,5 @@ Every card includes an **"Open in Obsidian"** link. Clicking it from Anki opens 
 
 - All synced cards are tagged `obsidian_simple_anki_sync_created` in Anki for easy filtering
 - Images (`![[image.png]]`), LaTeX (`$...$`, `$$...$$`), bold (`**text**`), and Excalidraw files are all supported
-- Card state survives plugin restarts — tracked IDs are persisted locally
+- Card state survives plugin restarts. Tracked IDs are persisted locally
 - If Anki is not running, sync is silently skipped and retried on next edit
