@@ -1,4 +1,4 @@
-import { requestUrl } from 'obsidian';
+import * as https from 'https';
 import { SimpleAnkiSyncSettings } from './settings';
 import { GeneratedCard } from './types';
 
@@ -24,6 +24,35 @@ Schema:
   "deck": "chosen or new deck name",
   "correctedBulletText": "original text with typos fixed (omit if no changes needed)"
 }`;
+
+function nodePost(hostname: string, path: string, headers: Record<string, string>, body: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const buf = Buffer.from(body, 'utf8');
+    const req = https.request(
+      {
+        hostname,
+        path,
+        method: 'POST',
+        headers: { ...headers, 'Content-Length': buf.length },
+      },
+      (res) => {
+        const chunks: Buffer[] = [];
+        res.on('data', (c: Buffer) => chunks.push(c));
+        res.on('end', () => {
+          const text = Buffer.concat(chunks).toString('utf8');
+          if (res.statusCode && (res.statusCode < 200 || res.statusCode >= 300)) {
+            reject(new Error(`HTTP ${res.statusCode}: ${text}`));
+          } else {
+            resolve(text);
+          }
+        });
+      }
+    );
+    req.on('error', reject);
+    req.write(buf);
+    req.end();
+  });
+}
 
 export class LlmService {
   async generateCard(
@@ -52,60 +81,49 @@ Default deck: "${settings.defaultDeck}"`;
         : await this.callOpenAI(userMessage, settings);
       return this.parseResponse(raw);
     } catch (err) {
-      console.error('Simple Anki Sync: LLM error:', err);
+      console.error('Markki: LLM error:', err);
       return null;
     }
   }
 
   private async callOpenAI(userMessage: string, settings: SimpleAnkiSyncSettings): Promise<string> {
-    const baseUrl = settings.llmApiBaseUrl.replace(/\/$/, '');
-    const response = await requestUrl({
-      url: `${baseUrl}/chat/completions`,
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': `Bearer ${settings.llmApiKey}`,
-      },
-      body: JSON.stringify({
-        model: settings.llmModel,
-        messages: [
-          { role: 'system', content: SYSTEM_PROMPT },
-          { role: 'user', content: userMessage },
-        ],
-        response_format: { type: 'json_object' },
-        temperature: 0.3,
-      }),
+    const base = settings.llmApiBaseUrl.replace(/\/$/, '');
+    const url = new URL(`${base}/chat/completions`);
+    const body = JSON.stringify({
+      model: settings.llmModel,
+      messages: [
+        { role: 'system', content: SYSTEM_PROMPT },
+        { role: 'user', content: userMessage },
+      ],
+      response_format: { type: 'json_object' },
+      temperature: 0.3,
     });
 
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(`OpenAI API ${response.status}: ${response.text}`);
-    }
+    const text = await nodePost(url.hostname, url.pathname + url.search, {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${settings.llmApiKey}`,
+    }, body);
 
-    return response.json.choices?.[0]?.message?.content ?? '';
+    const data = JSON.parse(text);
+    return data.choices?.[0]?.message?.content ?? '';
   }
 
   private async callAnthropic(userMessage: string, settings: SimpleAnkiSyncSettings): Promise<string> {
-    const response = await requestUrl({
-      url: 'https://api.anthropic.com/v1/messages',
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'x-api-key': settings.llmApiKey,
-        'anthropic-version': '2023-06-01',
-      },
-      body: JSON.stringify({
-        model: settings.llmModel,
-        max_tokens: 1024,
-        system: SYSTEM_PROMPT,
-        messages: [{ role: 'user', content: userMessage }],
-      }),
+    const body = JSON.stringify({
+      model: settings.llmModel,
+      max_tokens: 1024,
+      system: SYSTEM_PROMPT,
+      messages: [{ role: 'user', content: userMessage }],
     });
 
-    if (response.status < 200 || response.status >= 300) {
-      throw new Error(`Anthropic API ${response.status}: ${response.text}`);
-    }
+    const text = await nodePost('api.anthropic.com', '/v1/messages', {
+      'Content-Type': 'application/json',
+      'x-api-key': settings.llmApiKey,
+      'anthropic-version': '2023-06-01',
+    }, body);
 
-    return response.json.content?.[0]?.text ?? '';
+    const data = JSON.parse(text);
+    return data.content?.[0]?.text ?? '';
   }
 
   private parseResponse(content: string): GeneratedCard {
