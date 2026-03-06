@@ -1,10 +1,10 @@
 {
-  "id": "simple-anki-sync",
-  "name": "Simple Anki Sync",
-  "version": "1.5.2",
+  "id": "markki",
+  "name": "Markki",
+  "version": "2.0.0",
   "minAppVersion": "0.15.0",
-  "description": "The simplest way of syncing simple Flashchards with Anki.",
-  "author": "Lukas Mayr",
-  "authorUrl": "lukas-mayr.com",
-  "isDesktopOnly": true
+  "description": "Mark bullet points as Anki flashcards — AI generates the card, sync happens automatically.",
+  "author": "Lyqed",
+  "authorUrl": "https://github.com/Lyqed",
+  "isDesktopOnly": false
 }

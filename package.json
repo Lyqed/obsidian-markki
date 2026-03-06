@@ -1,7 +1,7 @@
 {
-  "name": "simple-anki-sync",
-  "version": "1.5.2",
-  "description": "Personal Anki Sync Plugin for Obsidian.",
+  "name": "markki",
+  "version": "2.0.0",
+  "description": "Mark bullet points as Anki flashcards — AI generates the card, sync happens automatically.",
   "main": "main.js",
   "scripts": {
     "dev": "rollup -c rollup.config.mjs -w",
@@ -10,17 +10,18 @@
   "keywords": [
     "obsidian-plugin",
     "anki",
+    "flashcards",
+    "ai",
+    "llm",
+    "bullets",
     "sync",
-    "markdown",
-    "tables",
-    "images",
-    "deletion",
-    "sync-plugin",
     "obsidian"
   ],
-  "author": "Lukas Mayr",
+  "author": "Lyqed",
   "license": "MIT",
   "devDependencies": {
+    "@codemirror/state": "^6.5.0",
+    "@codemirror/view": "^6.38.6",
     "@rollup/plugin-commonjs": "^28.0.3",
     "@rollup/plugin-node-resolve": "^16.0.1",
     "@rollup/plugin-typescript": "^12.1.2",

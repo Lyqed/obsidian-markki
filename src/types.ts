@@ -1,23 +1,23 @@
-export interface AnkiNote {
-  noteId?: number;
-  front: string;
-  back: string;
-  deckName: string;
+export interface AnkiMarker {
+  line: number;
+  id?: number;
+  deck?: string;
+  bulletText: string;
+  markerFull: string;
 }
 
-export interface ObsidianNote {
-  sourceId: string;
+export interface GeneratedCard {
+  cardType: 'basic' | 'cloze';
   front: string;
-  back: string;
-  noteId?: number;
-  startLine: number;
-  endLine: number;
+  back?: string;
+  deck: string;
+  correctedBulletText?: string;
 }
 
 export interface ProcessedMediaResult {
   content: string;
   mediaToUpload: {
     ankiFileName: string;
-    dataBase64:   string;
+    dataBase64: string;
   }[];
 }

@@ -1,455 +1,463 @@
-﻿import { Plugin, TFile, MarkdownView, Notice, arrayBufferToBase64, ObsidianProtocolData } from 'obsidian';
+import { Plugin, TFile, MarkdownView, Notice, arrayBufferToBase64, ObsidianProtocolData } from 'obsidian';
+import { EditorView } from '@codemirror/view';
 import { AnkiService } from './anki-service';
-import { ObsidianNote, ProcessedMediaResult } from './types';
+import { LlmService } from './llm-service';
+import { AnkiMarker, GeneratedCard, ProcessedMediaResult } from './types';
 import { DEFAULT_SETTINGS, SimpleAnkiSyncSettingTab, SimpleAnkiSyncSettings } from './settings';
-import { TableToggleManager } from './table-toggle';
+import { createAnkiMarkerExtension } from './cm6-marker';
 
-// Regex-Templates
-const DECK_TAG = /#anki\/([^\s]+)/;
-const NOTE_ID_COMMENT = /<!--ANKI_NOTE_ID:(\d+)-->/;
-const NOTE_ID_COMMENT_GLOBAL = /<!--ANKI_NOTE_ID:(\d+)-->/g;
+interface PluginData {
+  settings: SimpleAnkiSyncSettings;
+  trackedIds: Record<string, number[]>;
+  bulletTextHashes: Record<string, string>;
+}
+
+// ── Regex ──────────────────────────────────────────────────────────────────
+const ANKI_MARKER_RE = /<!--\s*anki(?:\s[^>]*)?\s*-->/;
 const IMAGE_EMBED = /!\[\[([^|\]\n]+)(?:\|(\d+))?\]\]/g;
 const BLOCK_LATEX = /\$\$([\s\S]*?)\$\$/g;
 const INLINE_LATEX = /(?<![\$\\])\$([^$]+?)(?<!\\)\$/g;
 
-const DEFAULT_MODEL = 'Basic';
-const EMPTY_ANKI_BLOCK = `|     |\n| --- |\n|     |`;
+// ── Marker helpers ─────────────────────────────────────────────────────────
+
+function parseMarkerAttrs(markerText: string): { id?: number; deck?: string } {
+  const idMatch = markerText.match(/\bid="(\d+)"/);
+  const deckMatch = markerText.match(/\bdeck="([^"]+)"/);
+  return {
+    id: idMatch ? parseInt(idMatch[1], 10) : undefined,
+    deck: deckMatch ? deckMatch[1] : undefined,
+  };
+}
+
+function parseAnkiMarkers(content: string): AnkiMarker[] {
+  const lines = content.split('\n');
+  const markers: AnkiMarker[] = [];
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const match = line.match(ANKI_MARKER_RE);
+    if (!match) continue;
+
+    const markerText = match[0];
+    const attrs = parseMarkerAttrs(markerText);
+
+    // Bullet text = everything before the marker, stripped of leading bullet chars
+    const textPart = line.slice(0, match.index).trim();
+    const bulletText = textPart.replace(/^[\s]*(?:[-*+]|\d+\.)\s+/, '');
+
+    markers.push({
+      line: i,
+      id: attrs.id,
+      deck: attrs.deck,
+      bulletText,
+      markerFull: markerText,
+    });
+  }
+
+  return markers;
+}
+
+function buildMarker(attrs: { id?: number; deck?: string }): string {
+  const parts: string[] = ['anki'];
+  if (attrs.deck) parts.push(`deck="${attrs.deck}"`);
+  if (attrs.id !== undefined) parts.push(`id="${attrs.id}"`);
+  return `<!-- ${parts.join(' ')} -->`;
+}
+
+/** Replace the anki marker on a line while preserving all other attrs. */
+function replaceMarkerOnLine(line: string, newAttrs: { id?: number; deck?: string }): string {
+  return line.replace(ANKI_MARKER_RE, buildMarker(newAttrs));
+}
+
+/** Replace the bullet text portion of a line, keeping indent, bullet char, and marker intact. */
+function replaceBulletText(line: string, newText: string): string {
+  const match = line.match(/^([\s]*(?:[-*+]|\d+\.)\s+)(.*?)\s*(<!--\s*anki(?:\s[^>]*)?\s*-->)(.*)?$/s);
+  if (!match) return line;
+  return `${match[1]}${newText} ${match[3]}${match[4] ?? ''}`;
+}
+
+// ── Plugin ─────────────────────────────────────────────────────────────────
 
 export default class SimpleAnkiSyncPlugin extends Plugin {
   private anki!: AnkiService;
+  private llm!: LlmService;
   public settings: SimpleAnkiSyncSettings = DEFAULT_SETTINGS;
-  private tableToggle!: TableToggleManager;
+
+  // Debounce timers: filePath → timer handle
+  private syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // Cross-session state persisted via loadData/saveData
+  private trackedIds = new Map<string, Set<number>>();
+  private bulletTextHashes = new Map<number, string>();
+  // Guard: content we wrote ourselves (to skip re-triggering on vault.modify)
+  private lastWrittenContent = new Map<string, string>();
 
   async onload() {
     console.log('Loading Simple Anki Sync Plugin');
     this.anki = new AnkiService(this.app);
+    this.llm = new LlmService();
 
-    await this.loadSettings();
-
-    this.tableToggle = new TableToggleManager(this.settings);
-    this.tableToggle.registerMarkdownPostProcessor(this);
-    this.tableToggle.onLoad();
+    await this.loadPersistedData();
 
     this.addSettingTab(new SimpleAnkiSyncSettingTab(this.app, this));
 
-    this.addCommand({
-      id: 'sync-current-file-with-anki',
-      name: 'Sync current file with Anki',
-      checkCallback: (checking) => {
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (view?.file) {
-          if (!checking) this.syncFile(view.file);
-          return true;
+    // ── CM6 extension: marker hiding + keystroke debounce ─────────────────
+    this.registerEditorExtension(
+      createAnkiMarkerExtension((view: EditorView) => {
+        const file = this.app.workspace.getActiveFile();
+        if (file) this.scheduleFileSync(file);
+      })
+    );
+
+    // ── Fallback: handle external file changes (Obsidian Sync, etc.) ──────
+    this.registerEvent(
+      this.app.vault.on('modify', async (abstractFile) => {
+        if (!(abstractFile instanceof TFile)) return;
+        if (abstractFile.extension !== 'md') return;
+        // Skip if this modify was triggered by our own write
+        if (this.lastWrittenContent.get(abstractFile.path) !== undefined) {
+          const content = await this.app.vault.read(abstractFile);
+          if (this.lastWrittenContent.get(abstractFile.path) === content) {
+            this.lastWrittenContent.delete(abstractFile.path);
+            return;
+          }
+          this.lastWrittenContent.delete(abstractFile.path);
         }
-        return false;
-      },
-    });
+        this.scheduleFileSync(abstractFile);
+      })
+    );
 
+    // ── Commands ──────────────────────────────────────────────────────────
     this.addCommand({
-      id: 'sync-vault-with-anki',
-      name: 'Sync entire vault with Anki',
-      callback: async () => {
-        await this.syncVault();
-      },
-    });
-
-    this.addCommand({
-      id: 'unsync-current-file-with-anki',
-      name: 'Unsync current file with Anki',
+      id: 'mark-bullet-as-anki-card',
+      name: 'Mark bullet as Anki card',
       checkCallback: (checking) => {
         const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (view?.file) {
-          if (!checking) this.unSyncFile(view.file);
-          return true;
-        }
-        return false;
-      },
-    });
-
-    this.addCommand({
-      id: 'collapse-anki-card-tables',
-      name: 'Collapse all Anki card tables on page',
-      checkCallback: (checking) => {
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!view) return false;
-        if (checking) return true;
-        if (!this.settings.enableAnswerToggle) {
-          new Notice('Answer table toggles are disabled in settings.');
-          return;
-        }
-        this.tableToggle.setTablesCollapsedInScope(view.contentEl, true);
-      },
-    });
-
-    this.addCommand({
-      id: 'expand-anki-card-tables',
-      name: 'Expand all Anki card tables on page',
-      checkCallback: (checking) => {
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!view) return false;
-        if (checking) return true;
-        if (!this.settings.enableAnswerToggle) {
-          new Notice('Answer table toggles are disabled in settings.');
-          return;
-        }
-        this.tableToggle.setTablesCollapsedInScope(view.contentEl, false);
-      },
-    });
-
-    this.addCommand({
-      id: 'insert-empty-anki-card',
-      name: 'Insert empty Anki card block',
-      checkCallback: (checking) => {
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (!view || !view.editor) return false;
+        if (!view?.editor) return false;
         if (checking) return true;
 
         const editor = view.editor;
-        editor.replaceRange(EMPTY_ANKI_BLOCK, editor.getCursor());
-        if (this.settings.enableAnswerToggle) {
-          window.setTimeout(() => {
-            this.tableToggle?.setTablesCollapsedInScope(view.contentEl, false);
-          }, 0);
+        const cursor = editor.getCursor();
+        const line = editor.getLine(cursor.line);
+
+        // Only mark if it looks like a bullet and doesn't already have a marker
+        if (ANKI_MARKER_RE.test(line)) {
+          new Notice('This line already has an Anki marker.');
+          return;
         }
-        return;
+
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('-') && !trimmed.startsWith('*') && !trimmed.startsWith('+') && !/^\d+\./.test(trimmed)) {
+          new Notice('Place the cursor on a bullet point line.');
+          return;
+        }
+
+        const newLine = line.trimEnd() + ' <!-- anki -->';
+        editor.setLine(cursor.line, newLine);
       },
     });
 
+    // ── Custom protocol handler for backlinks ─────────────────────────────
     this.registerObsidianProtocolHandler('simple-anki-sync', this.handleCustomProtocol.bind(this));
-  }
-
-  private async handleCustomProtocol(params: ObsidianProtocolData) {
-    if (params.action === 'simple-anki-sync') {
-      const { file, noteId } = params;
-      if (!file || !noteId) return;
-
-      const abstractFile = this.app.vault.getAbstractFileByPath(file);
-      if (!(abstractFile instanceof TFile)) return;
-
-      const leaf = this.app.workspace.getLeaf(false);
-      await leaf.openFile(abstractFile);
-
-      const content = await this.app.vault.read(abstractFile);
-      const lines = content.split('\n');
-
-      const searchFor = `<!--ANKI_NOTE_ID:${noteId}-->`;
-      const lineNumber = lines.findIndex(line => line.includes(searchFor));
-
-      if (lineNumber !== -1) {
-        // Find where the trailing Anki comment or `<br>` tags start, so we can place the cursor exactly there
-        const line = lines[lineNumber];
-        const match = line.match(/(?:<br\s*\/?>\s*)*<!--ANKI_NOTE_ID:\d+-->/i);
-        const column = match ? match.index || 0 : 0;
-
-        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-        if (view && view.editor) { // only if in edit mode
-          view.editor.setCursor(lineNumber, column);
-          view.editor.scrollIntoView({ from: { line: lineNumber, ch: 0 }, to: { line: lineNumber, ch: 0 } }, true);
-        }
-      }
-    }
   }
 
   onunload() {
     console.log('Unloading Simple Anki Sync Plugin');
-    this.tableToggle?.onUnload();
+    // Cancel pending timers
+    for (const timer of this.syncTimers.values()) clearTimeout(timer);
+    this.syncTimers.clear();
+    // Persist state
+    this.persistData();
   }
 
-  private async loadSettings(): Promise<void> {
-    this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+  // ── Settings ─────────────────────────────────────────────────────────────
+
+  private async loadPersistedData(): Promise<void> {
+    const data = (await this.loadData()) as PluginData | null;
+    if (!data) {
+      this.settings = { ...DEFAULT_SETTINGS };
+      return;
+    }
+    this.settings = Object.assign({}, DEFAULT_SETTINGS, data.settings ?? {});
+
+    if (data.trackedIds) {
+      for (const [path, ids] of Object.entries(data.trackedIds)) {
+        this.trackedIds.set(path, new Set(ids));
+      }
+    }
+    if (data.bulletTextHashes) {
+      for (const [id, text] of Object.entries(data.bulletTextHashes)) {
+        this.bulletTextHashes.set(parseInt(id, 10), text);
+      }
+    }
   }
 
   public async saveSettings(): Promise<void> {
-    await this.saveData(this.settings);
+    await this.persistData();
   }
 
-  public applyRowToggleSettings(): void {
-    this.tableToggle?.updateSettings(this.settings);
-    this.tableToggle?.applySettings();
+  private async persistData(): Promise<void> {
+    const trackedIdsObj: Record<string, number[]> = {};
+    for (const [path, ids] of this.trackedIds.entries()) {
+      trackedIdsObj[path] = [...ids];
+    }
+    const bulletHashesObj: Record<string, string> = {};
+    for (const [id, text] of this.bulletTextHashes.entries()) {
+      bulletHashesObj[id.toString()] = text;
+    }
+    const data: PluginData = {
+      settings: this.settings,
+      trackedIds: trackedIdsObj,
+      bulletTextHashes: bulletHashesObj,
+    };
+    await this.saveData(data);
   }
 
-  // Splits a table row into its cells
-  private splitTableRow(row: string): string[] {
-    const clean = row.trim().replace(/^\||\|$/g, '');
-    const cells: string[] = [];
-    let buf = '';
+  // ── Backlink protocol ─────────────────────────────────────────────────────
 
-    let inBrackets = false;    // [[...]]
-    let inInlineMath = false;  // $...$
-    let inBlockMath = false;   // $$...$$
+  private async handleCustomProtocol(params: ObsidianProtocolData) {
+    const { file, noteId } = params;
+    if (!file || !noteId) return;
 
-    for (let i = 0; i < clean.length; i++) {
-      if (!inInlineMath && clean.slice(i, i + 2) === '$$') {
-        inBlockMath = !inBlockMath;
-        buf += '$$';
-        i++;
-        continue;
-      }
-      if (!inBlockMath && clean[i] === '$') {
-        inInlineMath = !inInlineMath;
-        buf += '$';
-        continue;
-      }
-      if (!inBrackets && clean.slice(i, i + 2) === '[[') {
-        inBrackets = true;
-        buf += '[[';
-        i++;
-        continue;
-      }
-      if (inBrackets && clean.slice(i, i + 2) === ']]') {
-        inBrackets = false;
-        buf += ']]';
-        i++;
-        continue;
-      }
+    const abstractFile = this.app.vault.getAbstractFileByPath(file);
+    if (!(abstractFile instanceof TFile)) return;
 
-      const ch = clean[i];
-      if (ch === '\\' && clean[i + 1] === '|') {
-        buf += '|';
-        i++;
-        continue;
-      }
-      if (ch === '|' && !inBrackets && !inInlineMath && !inBlockMath) {
-        cells.push(buf.trim());
-        buf = '';
-        continue;
-      }
+    const leaf = this.app.workspace.getLeaf(false);
+    await leaf.openFile(abstractFile);
 
-      buf += ch;
-    }
-
-    cells.push(buf.trim());
-    return cells.filter((c) => c !== '' || cells.length === 1);
-  }
-
-  private extractInlineNoteId(back: string): { noteId?: number; cleanedBack: string } {
-    const match = back.match(NOTE_ID_COMMENT);
-    if (!match) {
-      return { cleanedBack: back };
-    }
-
-    const noteId = parseInt(match[1], 10);
-    const trailingPattern = new RegExp(
-      `(?:<br\\s*\\/?>\\s*)*${NOTE_ID_COMMENT.source}\\s*$`,
-      'i'
-    );
-    let cleanedBack = back;
-
-    if (trailingPattern.test(cleanedBack)) {
-      cleanedBack = cleanedBack.replace(trailingPattern, '');
-      cleanedBack = cleanedBack.replace(/\s+$/, '');
-    } else {
-      const inlinePattern = new RegExp(NOTE_ID_COMMENT.source, 'g');
-      cleanedBack = cleanedBack.replace(inlinePattern, '');
-    }
-
-    return { noteId, cleanedBack };
-  }
-
-  private appendNoteIdToRow(row: string, noteId: number): string {
-    if (NOTE_ID_COMMENT.test(row)) {
-      return row;
-    }
-
-    const match = row.match(/^(\s*\|)(.*)(\|\s*)$/);
-    if (!match) {
-      return row;
-    }
-
-    const [, left, cell, right] = match;
-    const trimmedCell = cell.replace(/\s+$/, '');
-    const spacer = trimmedCell.length ? '<br><br>' : '';
-    const updatedCell = `${trimmedCell}${spacer}<!--ANKI_NOTE_ID:${noteId}-->`;
-    return `${left}${updatedCell}${right}`;
-  }
-
-  private stripNoteIdFromCell(
-    cell: string,
-    noteId?: number
-  ): { updatedCell: string; removed: boolean } {
-    if (!cell.includes('ANKI_NOTE_ID')) {
-      return { updatedCell: cell, removed: false };
-    }
-    if (noteId && !cell.includes(`<!--ANKI_NOTE_ID:${noteId}-->`)) {
-      return { updatedCell: cell, removed: false };
-    }
-
-    const idPattern = noteId
-      ? `<!--ANKI_NOTE_ID:${noteId}-->`
-      : NOTE_ID_COMMENT.source;
-    const trailingPattern = new RegExp(
-      `(?:<br\\s*\\/?>\\s*)*${idPattern}\\s*$`,
-      'i'
-    );
-    let updatedCell = cell;
-
-    if (trailingPattern.test(updatedCell)) {
-      const trimmed = updatedCell.replace(trailingPattern, '').replace(/\s+$/, '');
-      return { updatedCell: trimmed, removed: trimmed !== cell };
-    }
-
-    const inlinePattern = noteId
-      ? new RegExp(`<!--ANKI_NOTE_ID:${noteId}-->`, 'g')
-      : new RegExp(NOTE_ID_COMMENT.source, 'g');
-    updatedCell = updatedCell.replace(inlinePattern, '');
-    return { updatedCell, removed: updatedCell !== cell };
-  }
-
-  private stripNoteIdFromLine(
-    line: string,
-    noteId?: number
-  ): { updatedLine: string; removed: boolean; removeLine: boolean } {
-    if (!line.includes('ANKI_NOTE_ID')) {
-      return { updatedLine: line, removed: false, removeLine: false };
-    }
-
-    const trimmed = line.trim();
-    const linePattern = noteId
-      ? new RegExp(`^<!--ANKI_NOTE_ID:${noteId}-->$`)
-      : new RegExp(`^${NOTE_ID_COMMENT.source}$`);
-    if (linePattern.test(trimmed)) {
-      return { updatedLine: '', removed: true, removeLine: true };
-    }
-
-    const rowMatch = line.match(/^(\s*\|)(.*)(\|\s*)$/);
-    if (rowMatch) {
-      const [, left, cell, right] = rowMatch;
-      const { updatedCell, removed } = this.stripNoteIdFromCell(cell, noteId);
-      if (removed) {
-        return {
-          updatedLine: `${left}${updatedCell}${right}`,
-          removed: true,
-          removeLine: false,
-        };
-      }
-    }
-
-    const inlinePattern = noteId
-      ? new RegExp(`<!--ANKI_NOTE_ID:${noteId}-->`, 'g')
-      : new RegExp(NOTE_ID_COMMENT.source, 'g');
-    const updatedLine = line.replace(inlinePattern, '');
-    return { updatedLine, removed: updatedLine !== line, removeLine: false };
-  }
-
-  // Parses the content of a file and extracts notes and deck name
-  private parseNotesFromContent(
-    content: string,
-    file: TFile
-  ): { notes: ObsidianNote[]; deckName: string | null } {
-    const tagMatch = content.match(DECK_TAG);
-    const deckName = tagMatch?.[1]?.replace(/\//g, '::') ?? null;
-    const notes: ObsidianNote[] = [];
+    const content = await this.app.vault.read(abstractFile);
     const lines = content.split('\n');
 
-    for (let i = 0; i < lines.length - 2; i++) {
-      const h = lines[i];
-      const sep = lines[i + 1];
-      const d = lines[i + 2];
+    // Find line containing the anki marker with this note ID
+    const lineNumber = lines.findIndex(
+      (line) => line.includes('<!-- anki') && line.includes(`id="${noteId}"`)
+    );
 
-      if (
-        h.trim().startsWith('|') &&
-        sep.match(/^\|\s*-{3,}\s*\|$/) &&
-        d.trim().startsWith('|')
-      ) {
-        const headerCells = this.splitTableRow(h);
-        const dataCells = this.splitTableRow(d);
-        if (headerCells.length !== 1 || dataCells.length !== 1) {
-          i++;
+    if (lineNumber !== -1) {
+      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+      if (view?.editor) {
+        view.editor.setCursor(lineNumber, 0);
+        view.editor.scrollIntoView(
+          { from: { line: lineNumber, ch: 0 }, to: { line: lineNumber, ch: 0 } },
+          true
+        );
+      }
+    }
+  }
+
+  // ── Auto-sync scheduling ──────────────────────────────────────────────────
+
+  private scheduleFileSync(file: TFile): void {
+    const existing = this.syncTimers.get(file.path);
+    if (existing) clearTimeout(existing);
+
+    const timer = setTimeout(async () => {
+      this.syncTimers.delete(file.path);
+      try {
+        await this.processFile(file);
+      } catch (err) {
+        console.error(`Simple Anki Sync: error processing ${file.path}:`, err);
+        new Notice(`Simple Anki Sync: error syncing "${file.basename}". See console.`);
+      }
+    }, 15000);
+
+    this.syncTimers.set(file.path, timer);
+  }
+
+  // ── Core sync logic ───────────────────────────────────────────────────────
+
+  private async processFile(file: TFile): Promise<void> {
+    const content = await this.app.vault.read(file);
+    const markers = parseAnkiMarkers(content);
+
+    // Skip files with no anki markers
+    if (markers.length === 0) {
+      // Still clean up tracked IDs if we know some used to exist
+      const previousIds = this.trackedIds.get(file.path);
+      if (previousIds && previousIds.size > 0) {
+        if (await this.anki.isConnected()) {
+          await this.anki.deleteNotes([...previousIds]);
+          this.trackedIds.delete(file.path);
+          await this.persistData();
+        }
+      }
+      return;
+    }
+
+    // Silently bail if Anki isn't reachable
+    if (!(await this.anki.isConnected())) return;
+
+    const currentIds = new Set(
+      markers.filter((m) => m.id !== undefined).map((m) => m.id!)
+    );
+    const previousIds = this.trackedIds.get(file.path) ?? new Set<number>();
+
+    // Delete cards whose markers were removed
+    const removedIds = [...previousIds].filter((id) => !currentIds.has(id));
+    if (removedIds.length > 0) {
+      await this.anki.deleteNotes(removedIds);
+      for (const id of removedIds) this.bulletTextHashes.delete(id);
+    }
+
+    // Fetch decks once for LLM (only when auto-deck enabled)
+    const availableDecks = this.settings.autoDeckEnabled ? await this.anki.fetchDecks() : [];
+
+    const vault = this.app.vault.getName();
+    const lines = content.split('\n');
+    let contentChanged = false;
+
+    for (const marker of markers) {
+      if (marker.id === undefined) {
+        // ── New marker: generate card and create in Anki ──
+        const generated = await this.llm.generateCard(marker.bulletText, availableDecks, this.settings);
+        if (!generated) {
+          new Notice(`Simple Anki Sync: failed to generate card for "${marker.bulletText.slice(0, 40)}"`);
           continue;
         }
 
-        const nextLine = lines[i + 3];
-        if (nextLine?.trim().startsWith('|')) {
-          i++;
-          continue;
-        }
+        const deck = this.resolveDeck(marker.deck, generated.deck);
+        await this.anki.createDeck(deck);
 
-        let existingId: number | undefined;
-        let endLine = i + 2;
+        const { front, back } = await this.prepareCardContent(generated, file);
+        const model = generated.cardType === 'cloze' ? 'Cloze' : 'Basic';
+        const fields: Record<string, string> = generated.cardType === 'cloze'
+          ? { Text: front, 'Back Extra': '' }
+          : { Front: front, Back: back };
 
-        const inlineId = this.extractInlineNoteId(dataCells[0]);
-        dataCells[0] = inlineId.cleanedBack;
-        if (inlineId.noteId) {
-          existingId = inlineId.noteId;
-        } else {
-          const maybeComment = lines[i + 3];
-          const idMatch = maybeComment?.match(NOTE_ID_COMMENT);
-          if (idMatch) {
-            existingId = parseInt(idMatch[1], 10);
-            endLine = i + 3;
-          }
-        }
+        const noteId = await this.anki.addNote(deck, model, fields);
+        if (!noteId) continue;
 
-        notes.push({
-          sourceId: `${file.path}-${i}`,
-          front: headerCells[0],
-          back: dataCells[0],
-          noteId: existingId,
-          startLine: i,
-          endLine,
+        // Now update the card with the real backlink URL (now that we have the ID)
+        const finalBack = this.appendObsidianLink(back, vault, file.path, noteId);
+        const finalFields: Record<string, string> = generated.cardType === 'cloze'
+          ? { Text: front, 'Back Extra': finalBack }
+          : { Front: front, Back: finalBack };
+        await this.anki.updateNote(noteId, finalFields);
+
+        // Update the line: write the ID (and resolved deck if it was "auto")
+        const newDeck = marker.deck === 'auto' ? generated.deck : marker.deck;
+        lines[marker.line] = replaceMarkerOnLine(lines[marker.line], {
+          id: noteId,
+          deck: newDeck,
         });
 
-        i = endLine;
+        // Apply corrected text if LLM changed it
+        const finalText = generated.correctedBulletText ?? marker.bulletText;
+        if (generated.correctedBulletText && generated.correctedBulletText !== marker.bulletText) {
+          lines[marker.line] = replaceBulletText(lines[marker.line], generated.correctedBulletText);
+        }
+
+        this.bulletTextHashes.set(noteId, finalText);
+        currentIds.add(noteId);
+        contentChanged = true;
+
+      } else {
+        // ── Existing marker: update if text changed ──
+        const prevHash = this.bulletTextHashes.get(marker.id);
+        if (prevHash !== undefined && prevHash === marker.bulletText) continue;
+
+        const generated = await this.llm.generateCard(marker.bulletText, availableDecks, this.settings);
+        if (!generated) continue;
+
+        const { front, back } = await this.prepareCardContent(generated, file);
+        const finalBack = this.appendObsidianLink(back, vault, file.path, marker.id);
+        const finalFields: Record<string, string> = generated.cardType === 'cloze'
+          ? { Text: front, 'Back Extra': finalBack }
+          : { Front: front, Back: finalBack };
+        await this.anki.updateNote(marker.id, finalFields);
+
+        const finalText = generated.correctedBulletText ?? marker.bulletText;
+        if (generated.correctedBulletText && generated.correctedBulletText !== marker.bulletText) {
+          lines[marker.line] = replaceBulletText(lines[marker.line], generated.correctedBulletText);
+          contentChanged = true;
+        }
+
+        this.bulletTextHashes.set(marker.id, finalText);
       }
     }
 
-    return { notes, deckName };
+    this.trackedIds.set(file.path, currentIds);
+
+    if (contentChanged) {
+      const newContent = lines.join('\n');
+      this.lastWrittenContent.set(file.path, newContent);
+      await this.app.vault.modify(file, newContent);
+    }
+
+    await this.persistData();
   }
 
-  private async processMedia(
-    text: string,
+  // ── Helpers ───────────────────────────────────────────────────────────────
+
+  private resolveDeck(markerDeck: string | undefined, llmDeck: string): string {
+    if (!markerDeck || markerDeck === 'auto') {
+      return this.settings.autoDeckEnabled ? llmDeck : this.settings.defaultDeck;
+    }
+    return markerDeck;
+  }
+
+  private appendObsidianLink(back: string, vault: string, filePath: string, noteId: number): string {
+    const url = `obsidian://simple-anki-sync?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(filePath)}&noteId=${noteId}`;
+    const sep = back ? '<br>' : '';
+    return `${back}${sep}<small><a href="${url}" style="text-decoration:none;color:grey;font-size:0.8em;">Open in Obsidian</a></small>`;
+  }
+
+  private async prepareCardContent(
+    generated: GeneratedCard,
     file: TFile
-  ): Promise<ProcessedMediaResult> {
+  ): Promise<{ front: string; back: string }> {
+    let front = generated.front ?? '';
+    let back = generated.back ?? '';
+
+    const frontMed = await this.processMedia(front, file);
+    const backMed = await this.processMedia(back, file);
+    for (const u of [...frontMed.mediaToUpload, ...backMed.mediaToUpload]) {
+      await this.anki.storeMediaBase64(u.ankiFileName, u.dataBase64);
+    }
+
+    front = this.convertLatexDelimiters(frontMed.content);
+    back = this.convertLatexDelimiters(backMed.content);
+    front = this.convertMarkdownBoldToHtml(front);
+    back = this.convertMarkdownBoldToHtml(back);
+
+    return { front, back };
+  }
+
+  private async processMedia(text: string, file: TFile): Promise<ProcessedMediaResult> {
     let out = text;
     const uploads: { ankiFileName: string; dataBase64: string }[] = [];
 
     const matches = Array.from(text.matchAll(IMAGE_EMBED));
     for (const m of matches) {
       const [md, linkPath, size] = m;
-      const imageFile = this.app.metadataCache.getFirstLinkpathDest(
-        linkPath,
-        file.path
-      );
+      const imageFile = this.app.metadataCache.getFirstLinkpathDest(linkPath, file.path);
       if (!(imageFile instanceof TFile)) continue;
 
       let dataBase64 = '';
-      let MathRandom = Math.floor(Math.random() * 10000000);
       let ankiFileName = imageFile.name;
+      const randomSuffix = Math.floor(Math.random() * 10_000_000);
 
-      const windowAsAny = window as any;
-      const isExcalidraw = windowAsAny.ExcalidrawAutomate && windowAsAny.ExcalidrawAutomate.isExcalidrawFile(imageFile);
+      const windowAsAny = window as unknown as Record<string, unknown>;
+      const ea = windowAsAny.ExcalidrawAutomate as
+        | { isExcalidrawFile(f: TFile): boolean; createPNG(path: string, scale: number): Promise<Blob> }
+        | undefined;
+      const isExcalidraw = ea?.isExcalidrawFile(imageFile) ?? false;
 
-      if (isExcalidraw) {
+      if (isExcalidraw && ea) {
         try {
-          const ea = windowAsAny.ExcalidrawAutomate;
-          // Scale 1.5 usually provides a good balance between quality and file size
           const blob = await ea.createPNG(imageFile.path, 1.5);
-          const arrayBuffer = await blob.arrayBuffer();
-
-          dataBase64 = arrayBufferToBase64(arrayBuffer);
-          ankiFileName = `${imageFile.basename}_${MathRandom}.png`;
+          dataBase64 = arrayBufferToBase64(await blob.arrayBuffer());
+          ankiFileName = `${imageFile.basename}_${randomSuffix}.png`;
         } catch (e) {
-          console.error('Simple Anki Sync: Failed to generate PNG from Excalidraw file', e);
-          // Fallback to reading the binary directly (which will be broken in Anki, but prevents a total crash)
-          const buffer = await this.app.vault.readBinary(imageFile);
-          dataBase64 = arrayBufferToBase64(buffer);
+          console.error('Simple Anki Sync: Excalidraw PNG failed', e);
+          dataBase64 = arrayBufferToBase64(await this.app.vault.readBinary(imageFile));
         }
       } else {
-        const buffer = await this.app.vault.readBinary(imageFile);
-        dataBase64 = arrayBufferToBase64(buffer);
+        dataBase64 = arrayBufferToBase64(await this.app.vault.readBinary(imageFile));
       }
 
-      uploads.push({
-        ankiFileName,
-        dataBase64,
-      });
-
-      // Anki requires URL encoding for filenames with spaces in the img src tag
+      uploads.push({ ankiFileName, dataBase64 });
       const encodedFileName = encodeURIComponent(ankiFileName);
-
-      const tag = size
-        ? `<img src="${encodedFileName}" width="${size}">`
-        : `<img src="${encodedFileName}">`;
+      const tag = size ? `<img src="${encodedFileName}" width="${size}">` : `<img src="${encodedFileName}">`;
       out = out.replace(md, tag);
     }
 
@@ -457,167 +465,10 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
   }
 
   private convertLatexDelimiters(text: string): string {
-    let tmp = text.replace(BLOCK_LATEX, '\\[$1\\]');
-    return tmp.replace(INLINE_LATEX, '\\($1\\)');
+    return text.replace(BLOCK_LATEX, '\\[$1\\]').replace(INLINE_LATEX, '\\($1\\)');
   }
 
   private convertMarkdownBoldToHtml(text: string): string {
-    // Convert Markdown bold (**text**) to HTML bold (<b>text</b>)
     return text.replace(/\*\*(.*?)\*\*/g, '<b>$1</b>');
-  }
-
-  async syncFile(file: TFile, silent = false): Promise<number[]> {
-    // Check AnkiConnect availability before syncing
-    if (!(await this.anki.verifyConnection())) {
-      new Notice('AnkiConnect is not available. Please make sure Anki is running and AnkiConnect is installed.');
-      return [];
-    }
-
-    if (!silent) new Notice(`Syncing ${file.basename}...`);
-    const orig = await this.app.vault.read(file);
-    const { notes, deckName } = this.parseNotesFromContent(orig, file);
-    if (!deckName) {
-      if (!silent) new Notice(`No #anki/deck tag found in ${file.basename}. Skipping.`);
-      return [];
-    }
-    await this.anki.createDeck(deckName);
-
-    const existingIds: number[] = [];
-    for (const m of orig.matchAll(NOTE_ID_COMMENT_GLOBAL)) existingIds.push(+m[1]);
-
-    const lines = orig.split('\n');
-    const newIds: number[] = [];
-
-    for (const note of notes) {
-      // Media
-      const frontMed = await this.processMedia(note.front, file);
-      const backMed = await this.processMedia(note.back, file);
-      for (const u of [...frontMed.mediaToUpload, ...backMed.mediaToUpload]) {
-        await this.anki.storeMediaBase64(u.ankiFileName, u.dataBase64);
-      }
-
-      // LaTeX
-      let frontHtml = this.convertLatexDelimiters(frontMed.content);
-      let backHtml = this.convertLatexDelimiters(backMed.content);
-
-      // Convert Markdown bold to HTML bold
-      frontHtml = this.convertMarkdownBoldToHtml(frontHtml);
-      backHtml = this.convertMarkdownBoldToHtml(backHtml);
-
-      // Obsidian-Link
-      const vault = this.app.vault.getName();
-      let url = '';
-      if (note.noteId) {
-        url = `obsidian://simple-anki-sync?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(file.path)}&noteId=${note.noteId}`;
-      } else {
-        url = `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(file.path)}`;
-      }
-
-      backHtml += `<br><small><a href="${url}" style="text-decoration:none;color:grey;font-size:0.8em;">Obsidian Note</a></small>`;
-
-      const fields = { Front: frontHtml, Back: backHtml };
-
-      if (note.noteId) {
-        await this.anki.updateNote(note.noteId, fields);
-        newIds.push(note.noteId);
-        const info = await this.anki.fetchCardInfo([note.noteId]);
-        if (info[0]?.deckName !== deckName) {
-          await this.anki.changeDeck([note.noteId], deckName);
-        }
-      } else {
-        const created = await this.anki.addNote(deckName, DEFAULT_MODEL, fields);
-        if (created) {
-          newIds.push(created);
-          const dataRowIndex = note.startLine + 2;
-          const updatedRow = this.appendNoteIdToRow(lines[dataRowIndex], created);
-          lines[dataRowIndex] = updatedRow;
-
-          // Replace the fallback URL with the precise custom protocol URL now that we have an ID
-          const newUrl = `obsidian://simple-anki-sync?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(file.path)}&noteId=${created}`;
-          const updatedBackHtml = backHtml.replace(url, newUrl);
-          await this.anki.updateNote(created, { Front: frontHtml, Back: updatedBackHtml });
-        }
-      }
-    }
-
-    // Remove old IDs and Anki-Cards
-    const toDelete = existingIds.filter(id => !newIds.includes(id));
-    if (toDelete.length) {
-      await this.anki.deleteNotes(toDelete);
-      for (const id of toDelete) {
-        for (let idx = lines.length - 1; idx >= 0; idx--) {
-          const result = this.stripNoteIdFromLine(lines[idx], id);
-          if (!result.removed) continue;
-          if (result.removeLine) {
-            lines.splice(idx, 1);
-          } else {
-            lines[idx] = result.updatedLine;
-          }
-        }
-      }
-    }
-
-    const updated = lines.join('\n');
-    if (updated !== orig) {
-      await this.app.vault.modify(file, updated);
-    }
-    if (!silent) new Notice(`${file.basename} synced.`);
-    return newIds;
-  }
-
-  async syncVault(): Promise<void> {
-    // Check AnkiConnect availability before vault sync
-    if (!(await this.anki.verifyConnection())) {
-      new Notice('AnkiConnect is not available. Please make sure Anki is running and AnkiConnect is installed.');
-      return;
-    }
-
-    new Notice('Starting vault sync. This may take a while...');
-    const files = this.app.vault.getMarkdownFiles();
-    for (const f of files) {
-      try {
-        await this.syncFile(f, true);
-      } catch (e) {
-        console.error(`Error in vault sync for ${f.path}:`, e);
-        new Notice(`Error syncing ${f.basename}. See console for Details.`);
-      }
-    }
-    new Notice('Vault sync complete.');
-  }
-
-  async unSyncFile(file: TFile, silent = false): Promise<void> {
-    // Check AnkiConnect availability before syncing
-    if (!(await this.anki.verifyConnection())) {
-      new Notice('AnkiConnect is not available. Please make sure Anki is running and AnkiConnect is installed.');
-      return;
-    }
-
-    if (!silent) new Notice(`Unsyncing ${file.basename}...`);
-    const orig = await this.app.vault.read(file);
-    const existingIds: number[] = [];
-    for (const m of orig.matchAll(NOTE_ID_COMMENT_GLOBAL)) existingIds.push(+m[1]);
-    const lines = orig.split('\n');
-
-    // Remove all IDs and Anki-Cards
-    if (existingIds.length) {
-      await this.anki.deleteNotes(existingIds);
-      const cleaned: string[] = [];
-      for (const line of lines) {
-        const result = this.stripNoteIdFromLine(line);
-        if (result.removeLine) {
-          continue;
-        }
-        cleaned.push(result.updatedLine);
-      }
-      lines.length = 0;
-      lines.push(...cleaned);
-    }
-
-    const updated = lines.join('\n');
-    if (updated !== orig) {
-      await this.app.vault.modify(file, updated);
-    }
-    if (!silent) new Notice(`${file.basename} successfully unsynced`);
-    return;
   }
 }
