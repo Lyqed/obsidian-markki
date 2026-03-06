@@ -8,6 +8,7 @@ export interface SimpleAnkiSyncSettings {
   llmModel: string;
   autoDeckEnabled: boolean;
   deckSpecificity: number;
+  syncDelaySeconds: number;
 }
 
 export const DEFAULT_SETTINGS: SimpleAnkiSyncSettings = {
@@ -18,6 +19,7 @@ export const DEFAULT_SETTINGS: SimpleAnkiSyncSettings = {
   llmModel: 'gpt-4o',
   autoDeckEnabled: false,
   deckSpecificity: 3,
+  syncDelaySeconds: 5,
 };
 
 export interface SettingsHost {
@@ -160,6 +162,23 @@ export class SimpleAnkiSyncSettingTab extends PluginSettingTab {
             })
         );
     }
+
+    // --- Sync delay ---
+    containerEl.createEl('h3', { text: 'Sync' });
+
+    new Setting(containerEl)
+      .setName('Sync delay (seconds)')
+      .setDesc('How long to wait after you stop typing before syncing a changed card to Anki.')
+      .addSlider((slider) =>
+        slider
+          .setLimits(1, 60, 1)
+          .setValue(this.plugin.settings.syncDelaySeconds)
+          .setDynamicTooltip()
+          .onChange(async (value) => {
+            this.plugin.settings.syncDelaySeconds = value;
+            await this.plugin.saveSettings();
+          })
+      );
 
     // --- Marker usage tip ---
     containerEl.createEl('h3', { text: 'Usage' });
