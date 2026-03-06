@@ -83,8 +83,10 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
   private llm!: LlmService;
   public settings: SimpleAnkiSyncSettings = DEFAULT_SETTINGS;
 
-  // Debounce timers for external file changes only
+  // Debounce timers keyed by file path
   private externalSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // Lock: files currently being processed (prevents concurrent runs)
+  private processingFiles = new Set<string>();
   // Cross-session state persisted via loadData/saveData
   private trackedIds = new Map<string, Set<number>>();
   private bulletTextHashes = new Map<number, string>();
@@ -100,11 +102,32 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
 
     this.addSettingTab(new SimpleAnkiSyncSettingTab(this.app, this));
 
-    // ── CM6 extension: marker hiding + doc-change debounce trigger ────────
+    // ── CM6 extension: marker hiding + smart sync trigger ─────────────────
     this.registerEditorExtension(
-      createAnkiMarkerExtension((_view: EditorView) => {
+      createAnkiMarkerExtension((view: EditorView) => {
         const file = this.app.workspace.getActiveFile();
         if (!file) return;
+
+        // If a tracked card ID is no longer in the document, the marker was
+        // deleted — process immediately instead of waiting for the debounce.
+        const trackedForFile = this.trackedIds.get(file.path);
+        if (trackedForFile && trackedForFile.size > 0) {
+          const docText = view.state.doc.toString();
+          const hasDeletedMarker = [...trackedForFile].some(
+            (id) => !docText.includes(`id="${id}"`)
+          );
+          if (hasDeletedMarker) {
+            const existing = this.externalSyncTimers.get(file.path);
+            if (existing) clearTimeout(existing);
+            this.externalSyncTimers.delete(file.path);
+            this.processFile(file).catch((err) =>
+              console.error(`Markki: error processing ${file.path}:`, err)
+            );
+            return;
+          }
+        }
+
+        // Otherwise debounce adds/edits by the configured delay.
         const existing = this.externalSyncTimers.get(file.path);
         if (existing) clearTimeout(existing);
         const delay = (this.settings.syncDelaySeconds ?? 5) * 1000;
@@ -236,6 +259,16 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
   // ── Core sync logic ───────────────────────────────────────────────────────
 
   private async processFile(file: TFile): Promise<void> {
+    if (this.processingFiles.has(file.path)) return;
+    this.processingFiles.add(file.path);
+    try {
+      await this._processFile(file);
+    } finally {
+      this.processingFiles.delete(file.path);
+    }
+  }
+
+  private async _processFile(file: TFile): Promise<void> {
     const content = await this.app.vault.read(file);
     const markers = parseAnkiMarkers(content);
 
@@ -323,7 +356,13 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
       } else {
         // ── Existing marker: update if text changed ──
         const prevHash = this.bulletTextHashes.get(marker.id);
-        if (prevHash !== undefined && prevHash === marker.bulletText) continue;
+        if (prevHash === undefined) {
+          // No stored hash (e.g. after plugin data reset, or bullet was moved).
+          // Initialize from current text so we don't call LLM unnecessarily.
+          this.bulletTextHashes.set(marker.id, marker.bulletText);
+          continue;
+        }
+        if (prevHash === marker.bulletText) continue;
 
         const generated = await this.llm.generateCard(marker.bulletText, availableDecks, this.settings);
         if (!generated) continue;
