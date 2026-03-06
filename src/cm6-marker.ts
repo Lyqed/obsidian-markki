@@ -68,19 +68,14 @@ const ankiMarkerTheme = EditorView.baseTheme({
 });
 
 export function createAnkiMarkerExtension(
-  onCursorChangeLine: (view: EditorView) => void
+  onDocChange: (view: EditorView) => void
 ): Extension[] {
   return [
     ankiMarkerPlugin,
     ankiMarkerTheme,
     EditorView.updateListener.of((update: ViewUpdate) => {
-      if (!update.selectionSet && !update.docChanged) return;
-
-      const prevLine = update.startState.doc.lineAt(update.startState.selection.main.head).number;
-      const currLine = update.state.doc.lineAt(update.state.selection.main.head).number;
-
-      if (prevLine !== currLine) {
-        onCursorChangeLine(update.view);
+      if (update.docChanged) {
+        onDocChange(update.view);
       }
     }),
   ];

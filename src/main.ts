@@ -100,15 +100,23 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
 
     this.addSettingTab(new SimpleAnkiSyncSettingTab(this.app, this));
 
-    // ── CM6 extension: marker hiding + cursor-leaves-line trigger ─────────
+    // ── CM6 extension: marker hiding + doc-change debounce trigger ────────
     this.registerEditorExtension(
       createAnkiMarkerExtension((_view: EditorView) => {
         const file = this.app.workspace.getActiveFile();
-        if (file) {
-          this.processFile(file).catch((err) => {
+        if (!file) return;
+        const existing = this.externalSyncTimers.get(file.path);
+        if (existing) clearTimeout(existing);
+        const delay = (this.settings.syncDelaySeconds ?? 5) * 1000;
+        const timer = setTimeout(async () => {
+          this.externalSyncTimers.delete(file.path);
+          try {
+            await this.processFile(file);
+          } catch (err) {
             console.error(`Markki: error processing ${file.path}:`, err);
-          });
-        }
+          }
+        }, delay);
+        this.externalSyncTimers.set(file.path, timer);
       })
     );
 
