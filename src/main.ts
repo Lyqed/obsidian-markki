@@ -21,6 +21,7 @@ const INLINE_LATEX = /(?<![\$\\])\$([^$]+?)(?<!\\)\$/g;
 // ── Marker helpers ─────────────────────────────────────────────────────────
 
 function parseMarkerAttrs(markerText: string): { id?: number; deck?: string } {
+  // Use first match only — guards against malformed markers with duplicate attrs.
   const idMatch = markerText.match(/\bid="(\d+)"/);
   const deckMatch = markerText.match(/\bdeck="([^"]+)"/);
   return {
@@ -354,7 +355,19 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
         changedLines.add(marker.line);
 
       } else {
-        // ── Existing marker: update if text changed ──
+        // ── Existing marker: normalize if malformed, update if text changed ──
+
+        // Rewrite the marker to its canonical form if it is malformed
+        // (e.g. duplicate id= attributes from a previous race condition).
+        const canonical = buildMarker({ id: marker.id, deck: marker.deck });
+        if (!lines[marker.line].includes(canonical)) {
+          lines[marker.line] = replaceMarkerOnLine(lines[marker.line], {
+            id: marker.id,
+            deck: marker.deck,
+          });
+          changedLines.add(marker.line);
+        }
+
         const prevHash = this.bulletTextHashes.get(marker.id);
         if (prevHash === undefined) {
           // No stored hash (e.g. after plugin data reset, or bullet was moved).
@@ -390,16 +403,19 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
       const newContent = lines.join('\n');
       this.lastWrittenContent.set(file.path, newContent);
 
-      // Apply changes line-by-line via the editor API first so CM6 sees no diff
-      // when vault.modify fires — this prevents the screen jump.
       const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
       if (activeView?.file?.path === file.path && activeView.editor) {
+        // Active file: patch only the changed lines via the editor API so the
+        // viewport is not disturbed, then write to disk via the adapter directly.
+        // vault.modify pushes the full content back through the editor pipeline
+        // and resets the viewport — that is the screen jump.
         for (const lineNum of changedLines) {
           activeView.editor.setLine(lineNum, lines[lineNum]);
         }
+        await this.app.vault.adapter.write(file.path, newContent);
+      } else {
+        await this.app.vault.modify(file, newContent);
       }
-
-      await this.app.vault.modify(file, newContent);
     }
 
     await this.persistData();
