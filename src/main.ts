@@ -273,7 +273,7 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
 
     const vault = this.app.vault.getName();
     const lines = content.split('\n');
-    let contentChanged = false;
+    const changedLines = new Set<number>();
 
     for (const marker of markers) {
       if (marker.id === undefined) {
@@ -318,7 +318,7 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
 
         this.bulletTextHashes.set(noteId, finalText);
         currentIds.add(noteId);
-        contentChanged = true;
+        changedLines.add(marker.line);
 
       } else {
         // ── Existing marker: update if text changed ──
@@ -338,7 +338,7 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
         const finalText = generated.correctedBulletText ?? marker.bulletText;
         if (generated.correctedBulletText && generated.correctedBulletText !== marker.bulletText) {
           lines[marker.line] = replaceBulletText(lines[marker.line], generated.correctedBulletText);
-          contentChanged = true;
+          changedLines.add(marker.line);
         }
 
         this.bulletTextHashes.set(marker.id, finalText);
@@ -347,22 +347,20 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
 
     this.trackedIds.set(file.path, currentIds);
 
-    if (contentChanged) {
+    if (changedLines.size > 0) {
       const newContent = lines.join('\n');
       this.lastWrittenContent.set(file.path, newContent);
 
-      // Save scroll position before the file modify resets it
+      // Apply changes line-by-line via the editor API first so CM6 sees no diff
+      // when vault.modify fires — this prevents the screen jump.
       const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
-      const isActiveFile = activeView?.file?.path === file.path;
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const scrollDOM = isActiveFile ? (activeView?.editor as any)?.cm?.scrollDOM as HTMLElement | undefined : undefined;
-      const savedScrollTop = scrollDOM?.scrollTop ?? 0;
+      if (activeView?.file?.path === file.path && activeView.editor) {
+        for (const lineNum of changedLines) {
+          activeView.editor.setLine(lineNum, lines[lineNum]);
+        }
+      }
 
       await this.app.vault.modify(file, newContent);
-
-      if (scrollDOM && savedScrollTop > 0) {
-        window.setTimeout(() => { scrollDOM.scrollTop = savedScrollTop; }, 50);
-      }
     }
 
     await this.persistData();
