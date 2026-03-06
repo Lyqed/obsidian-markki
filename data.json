@@ -1,0 +1,13 @@
+{
+  "settings": {
+    "defaultDeck": "Default",
+    "llmProvider": "openai",
+    "llmApiBaseUrl": "https://api.openai.com/v1",
+    "llmApiKey": "",
+    "llmModel": "gpt-4o",
+    "autoDeckEnabled": false,
+    "deckSpecificity": 3
+  },
+  "trackedIds": {},
+  "bulletTextHashes": {}
+}
