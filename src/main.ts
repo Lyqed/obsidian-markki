@@ -83,8 +83,8 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
   private llm!: LlmService;
   public settings: SimpleAnkiSyncSettings = DEFAULT_SETTINGS;
 
-  // Debounce timers: filePath → timer handle
-  private syncTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  // Debounce timers for external file changes only
+  private externalSyncTimers = new Map<string, ReturnType<typeof setTimeout>>();
   // Cross-session state persisted via loadData/saveData
   private trackedIds = new Map<string, Set<number>>();
   private bulletTextHashes = new Map<number, string>();
@@ -100,11 +100,15 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
 
     this.addSettingTab(new SimpleAnkiSyncSettingTab(this.app, this));
 
-    // ── CM6 extension: marker hiding + keystroke debounce ─────────────────
+    // ── CM6 extension: marker hiding + cursor-leaves-line trigger ─────────
     this.registerEditorExtension(
-      createAnkiMarkerExtension((view: EditorView) => {
+      createAnkiMarkerExtension((_view: EditorView) => {
         const file = this.app.workspace.getActiveFile();
-        if (file) this.scheduleFileSync(file);
+        if (file) {
+          this.processFile(file).catch((err) => {
+            console.error(`Markki: error processing ${file.path}:`, err);
+          });
+        }
       })
     );
 
@@ -122,7 +126,18 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
           }
           this.lastWrittenContent.delete(abstractFile.path);
         }
-        this.scheduleFileSync(abstractFile);
+        // Short debounce for external changes (Obsidian Sync, etc.)
+        const existing = this.externalSyncTimers.get(abstractFile.path);
+        if (existing) clearTimeout(existing);
+        const timer = setTimeout(async () => {
+          this.externalSyncTimers.delete(abstractFile.path);
+          try {
+            await this.processFile(abstractFile);
+          } catch (err) {
+            console.error(`Markki: error processing ${abstractFile.path}:`, err);
+          }
+        }, 2000);
+        this.externalSyncTimers.set(abstractFile.path, timer);
       })
     );
 
@@ -161,8 +176,8 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
   onunload() {
     console.log('Unloading Simple Anki Sync Plugin');
     // Cancel pending timers
-    for (const timer of this.syncTimers.values()) clearTimeout(timer);
-    this.syncTimers.clear();
+    for (const timer of this.externalSyncTimers.values()) clearTimeout(timer);
+    this.externalSyncTimers.clear();
     // Persist state
     this.persistData();
   }
@@ -208,25 +223,6 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
       bulletTextHashes: bulletHashesObj,
     };
     await this.saveData(data);
-  }
-
-  // ── Auto-sync scheduling ──────────────────────────────────────────────────
-
-  private scheduleFileSync(file: TFile): void {
-    const existing = this.syncTimers.get(file.path);
-    if (existing) clearTimeout(existing);
-
-    const timer = setTimeout(async () => {
-      this.syncTimers.delete(file.path);
-      try {
-        await this.processFile(file);
-      } catch (err) {
-        console.error(`Simple Anki Sync: error processing ${file.path}:`, err);
-        new Notice(`Simple Anki Sync: error syncing "${file.basename}". See console.`);
-      }
-    }, 15000);
-
-    this.syncTimers.set(file.path, timer);
   }
 
   // ── Core sync logic ───────────────────────────────────────────────────────
@@ -293,7 +289,7 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
         if (!noteId) continue;
 
         // Now update the card with the real backlink URL (now that we have the ID)
-        const finalBack = this.appendObsidianLink(back, vault, file.path, noteId);
+        const finalBack = this.appendObsidianLink(back, vault, file.path, noteId, marker.line + 1);
         const finalFields: Record<string, string> = generated.cardType === 'cloze'
           ? { Text: front, 'Back Extra': finalBack }
           : { Front: front, Back: finalBack };
@@ -325,7 +321,7 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
         if (!generated) continue;
 
         const { front, back } = await this.prepareCardContent(generated, file);
-        const finalBack = this.appendObsidianLink(back, vault, file.path, marker.id);
+        const finalBack = this.appendObsidianLink(back, vault, file.path, marker.id, marker.line + 1);
         const finalFields: Record<string, string> = generated.cardType === 'cloze'
           ? { Text: front, 'Back Extra': finalBack }
           : { Front: front, Back: finalBack };
@@ -374,8 +370,12 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
     return markerDeck;
   }
 
-  private appendObsidianLink(back: string, vault: string, filePath: string, _noteId: number): string {
-    const url = `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(filePath)}`;
+  private appendObsidianLink(back: string, vault: string, filePath: string, _noteId: number, line?: number): string {
+    // Use Advanced URI plugin format when a line number is available — opens the exact bullet.
+    // Falls back to plain obsidian://open if no line is given.
+    const url = line !== undefined
+      ? `obsidian://advanced-uri?vault=${encodeURIComponent(vault)}&filepath=${encodeURIComponent(filePath)}&line=${line}`
+      : `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(filePath)}`;
     const sep = back ? '<br>' : '';
     return `${back}${sep}<small><a href="${url}" style="text-decoration:none;color:grey;font-size:0.8em;">Open in Obsidian</a></small>`;
   }
