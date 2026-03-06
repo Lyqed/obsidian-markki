@@ -128,10 +128,10 @@ export class SimpleAnkiSyncSettingTab extends PluginSettingTab {
     containerEl.createEl('h3', { text: 'Deck selection' });
 
     new Setting(containerEl)
-      .setName('Auto-detect deck')
+      .setName('Auto-detect or create deck')
       .setDesc(
-        'When enabled, the LLM automatically selects or creates the best deck based on card content. ' +
-        'When disabled, cards go to the default deck (unless specified inline with deck="Name").'
+        'When enabled, the AI picks or creates the best deck for each card. ' +
+        'The default deck is ignored unless you explicitly set deck="Name" in the marker.'
       )
       .addToggle((toggle) =>
         toggle
