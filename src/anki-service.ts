@@ -3,7 +3,7 @@ import { Notice, TFile, App } from 'obsidian';
 const ANKI_CONNECT_URL = 'http://127.0.0.1:8765';
 const MANAGED_NOTE_TAG = 'obsidian_simple_anki_sync_created';
 
-async function sendRequest(action: string, params: any = {}): Promise<any> {
+async function sendRequest(action: string, params: Record<string, unknown> = {}): Promise<unknown> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.addEventListener('error', () =>
@@ -31,24 +31,30 @@ async function sendRequest(action: string, params: any = {}): Promise<any> {
 export class AnkiService {
   constructor(private app: App) {}
 
-  async verifyConnection(): Promise<boolean> {
+  /** Silent connection check — does not show a Notice on failure. */
+  async isConnected(): Promise<boolean> {
     try {
       await sendRequest('requestPermission');
-      const decks = await sendRequest('deckNames');
-      return Array.isArray(decks);
-    } catch (err) {
-      new Notice('AnkiConnect connection failed. Is Anki open with AnkiConnect installed?');
-      console.error('verifyConnection error:', err);
+      return true;
+    } catch {
       return false;
     }
   }
 
+  /** Checks connection and shows a Notice if Anki is unreachable. */
+  async verifyConnection(): Promise<boolean> {
+    const ok = await this.isConnected();
+    if (!ok) {
+      new Notice('AnkiConnect is not available. Please make sure Anki is running and AnkiConnect is installed.');
+    }
+    return ok;
+  }
+
   async fetchDecks(): Promise<string[]> {
     try {
-      return await sendRequest('deckNames');
+      return (await sendRequest('deckNames')) as string[];
     } catch (err) {
-      new Notice('Failed to retrieve deck list from Anki.');
-      console.error(err);
+      console.error('Simple Anki Sync: fetchDecks error:', err);
       return [];
     }
   }
@@ -89,7 +95,6 @@ export class AnkiService {
       await sendRequest('updateNoteFields', {
         note: { id: noteId, fields },
       });
-      // Ensure our tag persists
       const infos = await this.fetchNotesInfo([noteId]);
       if (infos[0] && !infos[0].tags.includes(MANAGED_NOTE_TAG)) {
         await sendRequest('updateNoteTags', {
@@ -107,65 +112,26 @@ export class AnkiService {
     if (!ids.length) return;
     try {
       await sendRequest('deleteNotes', { notes: ids });
-      new Notice(`Deleted ${ids.length} note(s) from Anki.`);
+      new Notice(`Deleted ${ids.length} Anki card(s).`);
     } catch (err) {
       new Notice(`Could not delete notes: ${err}`);
       console.error(err);
     }
   }
 
-  async fetchNotesInfo(ids: number[]): Promise<Array<{ noteId: number; fields: any; modelName: string; tags: string[] }>> {
+  async fetchNotesInfo(ids: number[]): Promise<Array<{ noteId: number; fields: Record<string, unknown>; modelName: string; tags: string[] }>> {
     if (!ids.length) return [];
     try {
-      return await sendRequest('notesInfo', { notes: ids });
+      return (await sendRequest('notesInfo', { notes: ids })) as Array<{ noteId: number; fields: Record<string, unknown>; modelName: string; tags: string[] }>;
     } catch (err) {
-      new Notice('Failed to fetch note info from Anki.');
-      console.error(err);
+      console.error('Simple Anki Sync: fetchNotesInfo error:', err);
       return [];
     }
   }
 
-  async findManagedNotes(): Promise<number[]> {
+  async storeMediaBase64(filename: string, data: string): Promise<string | null> {
     try {
-      const result = await sendRequest('findNotes', { query: `tag:${MANAGED_NOTE_TAG}` });
-      return Array.isArray(result) ? result : [];
-    } catch (err) {
-      new Notice('Could not find managed notes in Anki.');
-      console.error(err);
-      return [];
-    }
-  }
-
-  async changeDeck(cardIds: number[], deckName: string): Promise<boolean> {
-    try {
-      const ok = await sendRequest('changeDeck', { cards: cardIds, deck: deckName });
-      return ok === true;
-    } catch (err) {
-      new Notice(`Failed to move card(s): ${err}`);
-      console.error(err);
-      return false;
-    }
-  }
-
-  async fetchCardInfo(cardIds: number[]): Promise<Array<{ deckName: string }>> {
-    try {
-      return await sendRequest('cardsInfo', { cards: cardIds });
-    } catch (err) {
-      new Notice(`cardsInfo error: ${err}`);
-      console.error(err);
-      return [];
-    }
-  }
-
-  async storeMediaBase64(
-    filename: string,
-    data: string
-  ): Promise<string | null> {
-    try {
-      const result = await sendRequest('storeMediaFile', {
-        filename,
-        data, // the base64 payload
-      });
+      const result = await sendRequest('storeMediaFile', { filename, data });
       return typeof result === 'string' ? result : filename;
     } catch (err) {
       new Notice(`Failed to store media "${filename}": ${err}`);
@@ -180,7 +146,6 @@ export class AnkiService {
       // @ts-ignore
       return this.app.vault.adapter.getFullPath(file.path);
     }
-    console.warn(`File not found in vault: ${vaultPath}`);
     return null;
   }
 }
