@@ -380,7 +380,19 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
     if (contentChanged) {
       const newContent = lines.join('\n');
       this.lastWrittenContent.set(file.path, newContent);
+
+      // Save scroll position before the file modify resets it
+      const activeView = this.app.workspace.getActiveViewOfType(MarkdownView);
+      const isActiveFile = activeView?.file?.path === file.path;
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const scrollDOM = isActiveFile ? (activeView?.editor as any)?.cm?.scrollDOM as HTMLElement | undefined : undefined;
+      const savedScrollTop = scrollDOM?.scrollTop ?? 0;
+
       await this.app.vault.modify(file, newContent);
+
+      if (scrollDOM && savedScrollTop > 0) {
+        window.setTimeout(() => { scrollDOM.scrollTop = savedScrollTop; }, 50);
+      }
     }
 
     await this.persistData();
