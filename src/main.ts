@@ -396,6 +396,7 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
     }
 
     await this.persistData();
+    await this.anki.syncToAnkiWeb();
   }
 
   // ── Helpers ───────────────────────────────────────────────────────────────

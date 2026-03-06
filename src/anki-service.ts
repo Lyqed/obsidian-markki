@@ -140,6 +140,14 @@ export class AnkiService {
     }
   }
 
+  async syncToAnkiWeb(): Promise<void> {
+    try {
+      await sendRequest('sync');
+    } catch (err) {
+      console.error('Markki: AnkiWeb sync error:', err);
+    }
+  }
+
   resolveAbsolutePath(vaultPath: string): string | null {
     const file = this.app.vault.getAbstractFileByPath(vaultPath);
     if (file instanceof TFile) {
