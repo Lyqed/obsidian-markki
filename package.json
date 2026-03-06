@@ -1,6 +1,6 @@
 {
   "name": "markki",
-  "version": "2.0.3",
+  "version": "2.0.4",
   "description": "Bullet points to Anki flashcards, via AI. Sync happens automatically.",
   "main": "main.js",
   "scripts": {

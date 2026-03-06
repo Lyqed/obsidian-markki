@@ -68,12 +68,16 @@ export class LlmService {
       'very specific: always create a new narrowly-named deck',
     ][settings.deckSpecificity - 1];
 
+    const deckInstructions = settings.autoDeckEnabled
+      ? `Available decks: ${availableDecks.length > 0 ? availableDecks.join(', ') : '(none yet)'}
+Deck specificity: ${settings.deckSpecificity}/5 (${specificityDesc})
+Pick the most fitting deck from the list, or invent a new specific deck name if none fit well. Do NOT default to a generic deck just because it exists.`
+      : `Deck: "${settings.defaultDeck}" (use this exact name)`;
+
     const userMessage = `Convert this bullet point into an Anki flashcard:
 "${bulletText}"
 
-Available decks: ${availableDecks.length > 0 ? availableDecks.join(', ') : '(none yet)'}
-Deck specificity: ${settings.deckSpecificity}/5 (${specificityDesc})
-Default deck: "${settings.defaultDeck}"`;
+${deckInstructions}`;
 
     try {
       const raw = settings.llmProvider === 'anthropic'

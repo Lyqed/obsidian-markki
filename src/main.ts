@@ -1,4 +1,4 @@
-import { Plugin, TFile, MarkdownView, Notice, arrayBufferToBase64, ObsidianProtocolData } from 'obsidian';
+import { Plugin, TFile, MarkdownView, Notice, arrayBufferToBase64 } from 'obsidian';
 import { EditorView } from '@codemirror/view';
 import { AnkiService } from './anki-service';
 import { LlmService } from './llm-service';
@@ -156,8 +156,6 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
       },
     });
 
-    // ── Custom protocol handler for backlinks ─────────────────────────────
-    this.registerObsidianProtocolHandler('markki', this.handleCustomProtocol.bind(this));
   }
 
   onunload() {
@@ -210,38 +208,6 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
       bulletTextHashes: bulletHashesObj,
     };
     await this.saveData(data);
-  }
-
-  // ── Backlink protocol ─────────────────────────────────────────────────────
-
-  private async handleCustomProtocol(params: ObsidianProtocolData) {
-    const { file, noteId } = params;
-    if (!file || !noteId) return;
-
-    const abstractFile = this.app.vault.getAbstractFileByPath(file);
-    if (!(abstractFile instanceof TFile)) return;
-
-    const leaf = this.app.workspace.getLeaf(false);
-    await leaf.openFile(abstractFile);
-
-    const content = await this.app.vault.read(abstractFile);
-    const lines = content.split('\n');
-
-    // Find line containing the anki marker with this note ID
-    const lineNumber = lines.findIndex(
-      (line) => line.includes('<!-- anki') && line.includes(`id="${noteId}"`)
-    );
-
-    if (lineNumber !== -1) {
-      const view = this.app.workspace.getActiveViewOfType(MarkdownView);
-      if (view?.editor) {
-        view.editor.setCursor(lineNumber, 0);
-        view.editor.scrollIntoView(
-          { from: { line: lineNumber, ch: 0 }, to: { line: lineNumber, ch: 0 } },
-          true
-        );
-      }
-    }
   }
 
   // ── Auto-sync scheduling ──────────────────────────────────────────────────
@@ -408,8 +374,8 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
     return markerDeck;
   }
 
-  private appendObsidianLink(back: string, vault: string, filePath: string, noteId: number): string {
-    const url = `obsidian://markki?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(filePath)}&noteId=${noteId}`;
+  private appendObsidianLink(back: string, vault: string, filePath: string, _noteId: number): string {
+    const url = `obsidian://open?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(filePath)}`;
     const sep = back ? '<br>' : '';
     return `${back}${sep}<small><a href="${url}" style="text-decoration:none;color:grey;font-size:0.8em;">Open in Obsidian</a></small>`;
   }
