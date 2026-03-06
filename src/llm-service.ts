@@ -1,3 +1,4 @@
+import { requestUrl } from 'obsidian';
 import { SimpleAnkiSyncSettings } from './settings';
 import { GeneratedCard } from './types';
 
@@ -58,7 +59,8 @@ Default deck: "${settings.defaultDeck}"`;
 
   private async callOpenAI(userMessage: string, settings: SimpleAnkiSyncSettings): Promise<string> {
     const baseUrl = settings.llmApiBaseUrl.replace(/\/$/, '');
-    const response = await fetch(`${baseUrl}/chat/completions`, {
+    const response = await requestUrl({
+      url: `${baseUrl}/chat/completions`,
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -75,17 +77,16 @@ Default deck: "${settings.defaultDeck}"`;
       }),
     });
 
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`OpenAI API ${response.status}: ${body}`);
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`OpenAI API ${response.status}: ${response.text}`);
     }
 
-    const data = await response.json();
-    return data.choices?.[0]?.message?.content ?? '';
+    return response.json.choices?.[0]?.message?.content ?? '';
   }
 
   private async callAnthropic(userMessage: string, settings: SimpleAnkiSyncSettings): Promise<string> {
-    const response = await fetch('https://api.anthropic.com/v1/messages', {
+    const response = await requestUrl({
+      url: 'https://api.anthropic.com/v1/messages',
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -100,13 +101,11 @@ Default deck: "${settings.defaultDeck}"`;
       }),
     });
 
-    if (!response.ok) {
-      const body = await response.text();
-      throw new Error(`Anthropic API ${response.status}: ${body}`);
+    if (response.status < 200 || response.status >= 300) {
+      throw new Error(`Anthropic API ${response.status}: ${response.text}`);
     }
 
-    const data = await response.json();
-    return data.content?.[0]?.text ?? '';
+    return response.json.content?.[0]?.text ?? '';
   }
 
   private parseResponse(content: string): GeneratedCard {

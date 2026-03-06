@@ -157,7 +157,7 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
     });
 
     // ── Custom protocol handler for backlinks ─────────────────────────────
-    this.registerObsidianProtocolHandler('simple-anki-sync', this.handleCustomProtocol.bind(this));
+    this.registerObsidianProtocolHandler('markki', this.handleCustomProtocol.bind(this));
   }
 
   onunload() {
@@ -396,7 +396,7 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
   }
 
   private appendObsidianLink(back: string, vault: string, filePath: string, noteId: number): string {
-    const url = `obsidian://simple-anki-sync?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(filePath)}&noteId=${noteId}`;
+    const url = `obsidian://markki?vault=${encodeURIComponent(vault)}&file=${encodeURIComponent(filePath)}&noteId=${noteId}`;
     const sep = back ? '<br>' : '';
     return `${back}${sep}<small><a href="${url}" style="text-decoration:none;color:grey;font-size:0.8em;">Open in Obsidian</a></small>`;
   }
