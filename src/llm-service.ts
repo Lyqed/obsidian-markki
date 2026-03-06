@@ -7,8 +7,8 @@ Your task is to convert a bullet point into the most suitable Anki flashcard.
 Rules:
 1. Fix ALL typos and grammatical errors in the bullet text.
 2. Choose the best card type:
-   - "basic": for concepts, definitions, Q&A — create a clear question as front and answer as back.
-   - "cloze": for fill-in-the-blank, when a key term or fact should be recalled inline — wrap the key part with {{c1::...}}.
+   - "basic": for concepts, definitions, Q&A. Create a clear question as front and answer as back.
+   - "cloze": for fill-in-the-blank, when a key term or fact should be recalled inline. Wrap the key part with {{c1::...}}.
 3. For basic cards: front should be a clear question, back should be a concise answer.
 4. For cloze cards: return only the "front" field with {{c1::...}} notation (no "back" needed).
 5. Choose the most appropriate deck from the provided list based on the content.
@@ -31,11 +31,11 @@ export class LlmService {
     settings: SimpleAnkiSyncSettings
   ): Promise<GeneratedCard | null> {
     const specificityDesc = [
-      'very broad — reuse any existing deck even if loosely related',
-      'broad — reuse existing decks when reasonably related',
-      'balanced — reuse decks when clearly related, create new if unsure',
-      'specific — create a new deck unless an existing one is a strong match',
-      'very specific — always create a new narrowly-named deck',
+      'very broad: reuse any existing deck even if loosely related',
+      'broad: reuse existing decks when reasonably related',
+      'balanced: reuse decks when clearly related, create new if unsure',
+      'specific: create a new deck unless an existing one is a strong match',
+      'very specific: always create a new narrowly-named deck',
     ][settings.deckSpecificity - 1];
 
     const userMessage = `Convert this bullet point into an Anki flashcard:

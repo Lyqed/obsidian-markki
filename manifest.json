@@ -3,7 +3,7 @@
   "name": "Markki",
   "version": "2.0.0",
   "minAppVersion": "0.15.0",
-  "description": "Mark bullet points as Anki flashcards — AI generates the card, sync happens automatically.",
+  "description": "Bullet points to Anki flashcards, via AI. Sync happens automatically.",
   "author": "Lyqed",
   "authorUrl": "https://github.com/Lyqed",
   "isDesktopOnly": false

@@ -31,7 +31,7 @@ async function sendRequest(action: string, params: Record<string, unknown> = {})
 export class AnkiService {
   constructor(private app: App) {}
 
-  /** Silent connection check — does not show a Notice on failure. */
+  /** Silent connection check. Does not show a Notice on failure. */
   async isConnected(): Promise<boolean> {
     try {
       await sendRequest('requestPermission');
