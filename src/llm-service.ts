@@ -130,11 +130,26 @@ ${deckInstructions}`;
     return data.content?.[0]?.text ?? '';
   }
 
-  private parseResponse(content: string): GeneratedCard {
-    const jsonMatch = content.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error('No JSON in LLM response');
+  private extractJson(content: string): string {
+    const start = content.indexOf('{');
+    if (start === -1) throw new Error('No JSON in LLM response');
+    let depth = 0;
+    let inString = false;
+    let escape = false;
+    for (let i = start; i < content.length; i++) {
+      const ch = content[i];
+      if (escape) { escape = false; continue; }
+      if (ch === '\\' && inString) { escape = true; continue; }
+      if (ch === '"') { inString = !inString; continue; }
+      if (inString) continue;
+      if (ch === '{') depth++;
+      else if (ch === '}') { depth--; if (depth === 0) return content.slice(start, i + 1); }
+    }
+    throw new Error('Unbalanced JSON in LLM response');
+  }
 
-    const parsed = JSON.parse(jsonMatch[0]);
+  private parseResponse(content: string): GeneratedCard {
+    const parsed = JSON.parse(this.extractJson(content));
 
     if (!parsed.cardType || !parsed.front || !parsed.deck) {
       throw new Error(`LLM response missing required fields: ${content}`);
