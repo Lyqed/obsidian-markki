@@ -1,4 +1,4 @@
-import { Plugin, TFile, MarkdownView, Notice, arrayBufferToBase64 } from 'obsidian';
+import { Plugin, TFile, MarkdownView, Notice, arrayBufferToBase64, App, FuzzySuggestModal } from 'obsidian';
 import { EditorView } from '@codemirror/view';
 import { AnkiService } from './anki-service';
 import { LlmService } from './llm-service';
@@ -75,6 +75,18 @@ function replaceBulletText(line: string, newText: string): string {
   const match = line.match(/^([\s]*(?:[-*+]|\d+\.)\s+)(.*?)\s*(<!--\s*anki(?:\s[^>]*)?\s*-->)(.*)?$/s);
   if (!match) return line;
   return `${match[1]}${newText} ${match[3]}${match[4] ?? ''}`;
+}
+
+// ── Deck picker modal ──────────────────────────────────────────────────────
+
+class DeckPickerModal extends FuzzySuggestModal<string> {
+  constructor(app: App, private decks: string[], private onChoose: (deck: string) => void) {
+    super(app);
+    this.setPlaceholder('Choose a deck…');
+  }
+  getItems(): string[] { return this.decks; }
+  getItemText(item: string): string { return item; }
+  onChooseItem(item: string): void { this.onChoose(item); }
 }
 
 // ── Plugin ─────────────────────────────────────────────────────────────────
@@ -203,6 +215,45 @@ export default class SimpleAnkiSyncPlugin extends Plugin {
 
         const newLine = line.trimEnd() + ' <!-- anki -->';
         editor.setLine(cursor.line, newLine);
+      },
+    });
+
+    this.addCommand({
+      id: 'mark-bullet-as-anki-card-with-deck',
+      name: 'Mark bullet as Anki card with deck…',
+      checkCallback: (checking) => {
+        const view = this.app.workspace.getActiveViewOfType(MarkdownView);
+        if (!view?.editor) return false;
+        if (checking) return true;
+
+        const editor = view.editor;
+        const cursor = editor.getCursor();
+        const line = editor.getLine(cursor.line);
+
+        if (ANKI_MARKER_RE.test(line)) {
+          new Notice('This line already has an Anki marker.');
+          return;
+        }
+        const trimmed = line.trim();
+        if (!trimmed.startsWith('-') && !trimmed.startsWith('*') && !trimmed.startsWith('+') && !/^\d+\./.test(trimmed)) {
+          new Notice('Place the cursor on a bullet point line.');
+          return;
+        }
+
+        this.anki.fetchDecks().then((decks) => {
+          if (!decks.length) {
+            new Notice('No Anki decks found. Is Anki running with AnkiConnect installed?');
+            return;
+          }
+          new DeckPickerModal(this.app, decks, (deck) => {
+            const currentLine = editor.getLine(cursor.line);
+            if (ANKI_MARKER_RE.test(currentLine)) {
+              new Notice('This line already has an Anki marker.');
+              return;
+            }
+            editor.setLine(cursor.line, currentLine.trimEnd() + ` <!-- anki deck="${deck}" -->`);
+          }).open();
+        });
       },
     });
 
