@@ -1,4 +1,4 @@
-# Markki — Claude Instructions
+# Markki — development notes
 
 ## Project overview
 Obsidian plugin that converts bullet points into Anki flashcards via an LLM. Markers are inline HTML comments (`<!-- anki -->`). Cards are synced automatically when content changes.
